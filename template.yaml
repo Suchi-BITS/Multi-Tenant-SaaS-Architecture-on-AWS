@@ -1,0 +1,532 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Multi-tenant SaaS Application using AWS Serverless Services
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name
+
+  IsolationModel:
+    Type: String
+    Default: pool
+    AllowedValues:
+      - pool
+      - silo
+    Description: Data isolation model (pool = shared tables, silo = dedicated tables)
+
+Globals:
+  Function:
+    Runtime: python3.9
+    Timeout: 30
+    MemorySize: 512
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        ISOLATION_MODEL: !Ref IsolationModel
+        TENANT_TABLE: !Ref TenantTable
+        LOG_GROUP: !Ref ApplicationLogGroup
+    Layers:
+      - !Ref SharedLayer
+
+Resources:
+  # ===== Lambda Layer with Shared Code =====
+  SharedLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub '${AWS::StackName}-shared-layer'
+      Description: Shared utilities for multi-tenant SaaS
+      ContentUri: server/shared/
+      CompatibleRuntimes:
+        - python3.9
+      RetentionPolicy: Delete
+
+  # ===== DynamoDB Tables =====
+  TenantTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-tenants'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: tenant_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: tenant_id
+          KeyType: HASH
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  ProductsTablePool:
+    Type: AWS::DynamoDB::Table
+    Condition: IsPoolModel
+    Properties:
+      TableName: !Sub '${AWS::StackName}-products'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: tenant_id
+          AttributeType: S
+        - AttributeName: product_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: tenant_id
+          KeyType: HASH
+        - AttributeName: product_id
+          KeyType: RANGE
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  OrdersTablePool:
+    Type: AWS::DynamoDB::Table
+    Condition: IsPoolModel
+    Properties:
+      TableName: !Sub '${AWS::StackName}-orders'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: tenant_id
+          AttributeType: S
+        - AttributeName: order_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: tenant_id
+          KeyType: HASH
+        - AttributeName: order_id
+          KeyType: RANGE
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ===== Cognito User Pool =====
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${AWS::StackName}-users'
+      AutoVerifiedAttributes:
+        - email
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: false
+        - Name: tenant_id
+          AttributeDataType: String
+          Mutable: false
+        - Name: tenant_tier
+          AttributeDataType: String
+          Mutable: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub '${AWS::StackName}-client'
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+
+  # ===== API Gateway =====
+  SaaSApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub '${AWS::StackName}-api'
+      StageName: !Ref Environment
+      Cors:
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+        AllowOrigin: "'*'"
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+
+  # ===== Tenant Management Functions =====
+  RegisterTenantFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-register-tenant'
+      CodeUri: server/tenant/
+      Handler: tenant_handler.register_tenant
+      Environment:
+        Variables:
+          USER_POOL_ID: !Ref UserPool
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TenantTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - cognito-idp:CreateGroup
+              Resource: !GetAtt UserPool.Arn
+      Events:
+        RegisterApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SaaSApi
+            Path: /tenants
+            Method: POST
+            Auth:
+              Authorizer: NONE
+
+  GetTenantFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-get-tenant'
+      CodeUri: server/tenant/
+      Handler: tenant_handler.get_tenant
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref TenantTable
+      Events:
+        GetApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SaaSApi
+            Path: /tenants/{tenant_id}
+            Method: GET
+
+  UpdateTenantFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-update-tenant'
+      CodeUri: server/tenant/
+      Handler: tenant_handler.update_tenant
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TenantTable
+      Events:
+        UpdateApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SaaSApi
+            Path: /tenants/{tenant_id}
+            Method: PUT
+
+  DeleteTenantFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-delete-tenant'
+      CodeUri: server/tenant/
+      Handler: tenant_handler.delete_tenant
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TenantTable
+      Events:
+        DeleteApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SaaSApi
+            Path: /tenants/{tenant_id}
+            Method: DELETE
+
+  # ===== Authentication Functions =====
+  SignUpFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-signup'
+      CodeUri: server/auth/
+      Handler: auth_handler.signup
+      Environment:
+        Variables:
+          USER_POOL_ID: !Ref UserPool
+          CLIENT_ID: !Ref UserPoolClient
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - cognito-idp:SignUp
+                - cognito-idp:AdminAddUserToGroup
+              Resource: !GetAtt UserPool.Arn
+        - DynamoDBReadPolicy:
+            TableName: !Ref TenantTable
+      Events:
+        SignUpApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SaaSApi
+            Path: /auth/signup
+            Method: POST
+            Auth:
+              Authorizer: NONE
+
+  SignInFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-signin'
+      CodeUri: server/auth/
+      Handler: auth_handler.signin
+      Environment:
+        Variables:
+          USER_POOL_ID: !Ref UserPool
+          CLIENT_ID: !Ref UserPoolClient
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - cognito-idp:InitiateAuth
+              Resource: !GetAtt UserPool.Arn
+      Events:
+        SignInApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SaaSApi
+            Path: /auth/signin
+            Method: POST
+            Auth:
+              Authorizer: NONE
+
+  # ===== Product Management Functions =====
+  ListProductsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-list-products'
+      CodeUri: server/product/
+      Handler: product_handler.list_products
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !If [IsPoolModel, !Ref ProductsTablePool, '*']
+      Events:
+        ListApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SaaSApi
+            Path: /products
+            Method: GET
+
+  GetProductFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-get-product'
+      CodeUri: server/product/
+      Handler: product_handler.get_product
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !If [IsPoolModel, !Ref ProductsTablePool, '*']
+      Events:
+        GetApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SaaSApi
+            Path: /products/{id}
+            Method: GET
+
+  CreateProductFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-create-product'
+      CodeUri: server/product/
+      Handler: product_handler.create_product
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !If [IsPoolModel, !Ref ProductsTablePool, '*']
+        - DynamoDBReadPolicy:
+            TableName: !Ref TenantTable
+      Events:
+        CreateApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SaaSApi
+            Path: /products
+            Method: POST
+
+  UpdateProductFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-update-product'
+      CodeUri: server/product/
+      Handler: product_handler.update_product
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !If [IsPoolModel, !Ref ProductsTablePool, '*']
+      Events:
+        UpdateApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SaaSApi
+            Path: /products/{id}
+            Method: PUT
+
+  DeleteProductFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-delete-product'
+      CodeUri: server/product/
+      Handler: product_handler.delete_product
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !If [IsPoolModel, !Ref ProductsTablePool, '*']
+      Events:
+        DeleteApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SaaSApi
+            Path: /products/{id}
+            Method: DELETE
+
+  # ===== Order Management Functions =====
+  ListOrdersFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-list-orders'
+      CodeUri: server/order/
+      Handler: order_handler.list_orders
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !If [IsPoolModel, !Ref OrdersTablePool, '*']
+      Events:
+        ListApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SaaSApi
+            Path: /orders
+            Method: GET
+
+  GetOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-get-order'
+      CodeUri: server/order/
+      Handler: order_handler.get_order
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !If [IsPoolModel, !Ref OrdersTablePool, '*']
+      Events:
+        GetApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SaaSApi
+            Path: /orders/{id}
+            Method: GET
+
+  CreateOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-create-order'
+      CodeUri: server/order/
+      Handler: order_handler.create_order
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref OrderEventsTopic
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !If [IsPoolModel, !Ref OrdersTablePool, '*']
+        - DynamoDBReadPolicy:
+            TableName: !Ref TenantTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt OrderEventsTopic.TopicName
+      Events:
+        CreateApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SaaSApi
+            Path: /orders
+            Method: POST
+
+  UpdateOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-update-order'
+      CodeUri: server/order/
+      Handler: order_handler.update_order
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref OrderEventsTopic
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !If [IsPoolModel, !Ref OrdersTablePool, '*']
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt OrderEventsTopic.TopicName
+      Events:
+        UpdateApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SaaSApi
+            Path: /orders/{id}
+            Method: PUT
+
+  # ===== SNS Topic for Order Events =====
+  OrderEventsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-order-events'
+      DisplayName: Order Events Topic
+
+  # ===== CloudWatch Log Group =====
+  ApplicationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}'
+      RetentionInDays: 7
+
+  # ===== CloudWatch Dashboard =====
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["SaaSApplication", "TenantAPICall", {"stat": "Sum"}]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Total API Calls",
+                "yAxis": {"left": {"min": 0}}
+              }
+            }
+          ]
+        }
+
+Conditions:
+  IsPoolModel: !Equals [!Ref IsolationModel, 'pool']
+  IsSiloModel: !Equals [!Ref IsolationModel, 'silo']
+
+Outputs:
+  ApiUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${SaaSApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiUrl'
+
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolId'
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolClientId'
+
+  TenantTableName:
+    Description: Tenant DynamoDB Table Name
+    Value: !Ref TenantTable
+    Export:
+      Name: !Sub '${AWS::StackName}-TenantTable'
